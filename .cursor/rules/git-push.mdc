@@ -1,0 +1,17 @@
+---
+description: 変更後は GitHub と clasp の両方に push する
+alwaysApply: true
+---
+
+# nikkei-adr-ranking デプロイ
+
+コードを変更したら、作業完了時に必ず以下を実行する:
+
+1. **GitHub** (`https://github.com/marui-99/nikkei-adr-ranking`)
+   - `git add` → `git commit` → `git push origin main`
+   - ユーザーが明示的にコミットを止めていない限り、変更ごとにコミットして push する
+
+2. **Apps Script** (clasp)
+   - `clasp push` でリモートに反映
+
+コミットメッセージは変更内容を簡潔に。シークレット（`.clasprc.json`、Webhook URL 等）はコミットしない。

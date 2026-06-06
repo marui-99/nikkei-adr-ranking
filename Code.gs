@@ -1,0 +1,427 @@
+/**
+ * 日本株 ADR ADR-東証 Top 10（Google Apps Script / スタンドアロン）
+ *
+ * Apps Script:
+ *   https://script.google.com/home/projects/1BOpPAteTdkKriIfgG--FDNr2KaEB1-7-pnfrpkSjORx5ZqN0nAyK-AG9/edit
+ *
+ * データソース:
+ *   - nikkei225jp.com ADR 全銘柄
+ *   - https://nikkei225jp.com/adr/
+ *
+ * clasp push:
+ *   clasp push
+ *
+ * 初回セットアップ（Apps Script エディタから実行）:
+ *   1. setupProperties()  … SLACK_WEBHOOK_URL を設定
+ *   2. testSlackNotification()  … テスト通知
+ *   3. installDailyTrigger()  … 毎日 JST 6:05 自動通知
+ */
+
+const CONFIG = {
+  TRIGGER_HOUR_JST: 6,
+  TRIGGER_MINUTE_JST: 5,
+  MIN_ACTIVE_ROWS: 30,
+  DATA_BASE_URL: 'https://nikkei225jp.com',
+  DATA_REFERER: 'https://nikkei225jp.com/adr/',
+  PATH_ADR_ALL: '/_data/_nfsWEB/adr/_adr_all.js',
+  ADR_PAGE_URL: 'https://nikkei225jp.com/adr/',
+};
+
+/**
+ * 初回のみ Apps Script エディタから実行してください。
+ * SLACK_WEBHOOK_URL を ADR 用チャンネルの Webhook に差し替えてから Run。
+ */
+function setupProperties() {
+  PropertiesService.getScriptProperties().setProperties({
+    SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/xxx/xxx/xxx',
+  });
+  Logger.log('スクリプトプロパティを保存しました');
+}
+
+function installDailyTrigger() {
+  removeTriggers();
+  ScriptApp.newTrigger('runAfterAdrClose')
+    .timeBased()
+    .everyDays(1)
+    .atHour(CONFIG.TRIGGER_HOUR_JST)
+    .nearMinute(CONFIG.TRIGGER_MINUTE_JST)
+    .inTimezone('Asia/Tokyo')
+    .create();
+  Logger.log(
+    `ADR終了トリガーを設定しました（JST ${CONFIG.TRIGGER_HOUR_JST}:${String(
+      CONFIG.TRIGGER_MINUTE_JST
+    ).padStart(2, '0')}）`
+  );
+}
+
+function removeTriggers() {
+  ScriptApp.getProjectTriggers().forEach((t) => {
+    const fn = t.getHandlerFunction();
+    if (fn === 'runAfterAdrClose' || fn === 'updateAdrRanking') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+/** 時間トリガーから呼ばれるエントリポイント（ADR取引終了後） */
+function runAfterAdrClose() {
+  updateAdrRanking({ notifySlack: true });
+}
+
+function updateAdrRanking(options) {
+  options = options || {};
+  Logger.log('更新開始');
+
+  Logger.log('nikkei225jp.com から ADR データ取得中…');
+  const data = fetchAdrRankingData_();
+  Logger.log(
+    `取得完了: 全 ${data.allRows.length} 銘柄 / 有効 ${data.activeRows.length} 銘柄`
+  );
+
+  if (
+    options.notifySlack &&
+    data.activeRows.length < CONFIG.MIN_ACTIVE_ROWS &&
+    !options.testSlack
+  ) {
+    Logger.log(
+      `有効銘柄が ${data.activeRows.length} 件のため Slack 通知をスキップ`
+    );
+    return;
+  }
+
+  const updatedAt = buildUpdatedAt_();
+
+  if (options.notifySlack) {
+    Logger.log('Slack 通知中…');
+    notifySlack_({
+      updatedAt,
+      topUp: data.topUp,
+      topDown: data.topDown,
+      activeCount: data.activeRows.length,
+      sessionDate: data.sessionDateLabel,
+      isTest: !!options.testSlack,
+    });
+    Logger.log('Slack 通知完了');
+  }
+
+  Logger.log('実行完了');
+}
+
+function testSlackNotification() {
+  updateAdrRanking({ notifySlack: true, testSlack: true });
+  Logger.log('Slack テスト通知を送信しました');
+}
+
+// ---------------------------------------------------------------------------
+// Slack
+// ---------------------------------------------------------------------------
+
+const SLACK = {
+  USERNAME: 'ADR Watcher',
+  ICON_EMOJI: ':us:',
+  COLOR_UP: '#36a64f',
+  COLOR_DOWN: '#e01e5a',
+  COLOR_FLAT: '#949494',
+};
+
+function notifySlack_(data) {
+  const webhookUrl = PropertiesService.getScriptProperties().getProperty(
+    'SLACK_WEBHOOK_URL'
+  );
+  if (!webhookUrl) {
+    throw new Error(
+      'SLACK_WEBHOOK_URL が未設定です。setupProperties() を実行してください。'
+    );
+  }
+
+  const topUpRow = data.topUp[0];
+  const topDownRow = data.topDown[0];
+  const isTest = !!data.isTest;
+
+  const headline =
+    topUpRow && topDownRow
+      ? `📊 ${isTest ? 'テスト通知: ' : 'ADR終了: '}ADR-東証 *${formatPct_(
+          topUpRow.adrTsePct
+        )}*（${formatStockLabel_(topUpRow)}）` +
+        ` / *${formatPct_(topDownRow.adrTsePct)}*（${formatStockLabel_(
+          topDownRow
+        )}）`
+      : '📊 日本株 ADR ADR-東証レポート';
+
+  const metaLine =
+    '🏷️ 日本株 ADR · 📅 ' +
+    formatSlackDate_(data.updatedAt + (isTest ? '（テスト）' : '')) +
+    ` · セッション ${data.sessionDate || '—'} · 有効 ${data.activeCount} 銘柄`;
+
+  const bodyLines = [
+    metaLine,
+    '',
+    '*📈 ADR-東証 上昇 Top 10*',
+    formatSlackRank_(data.topUp),
+    '',
+    '*📉 ADR-東証 下落 Top 10*',
+    formatSlackRank_(data.topDown),
+    '',
+    `<${CONFIG.ADR_PAGE_URL}|📋 nikkei225jp.com ADR 一覧>`,
+  ];
+
+  const topPct = topUpRow ? topUpRow.adrTsePct : 0;
+  const attachment = {
+    color: slackColorForChange_(topPct),
+    title: '📊 日本株 ADR ADR-東証 Top 10',
+    title_link: CONFIG.ADR_PAGE_URL,
+    text: bodyLines.join('\n'),
+    mrkdwn_in: ['text'],
+    footer: 'nikkei225jp.com | ADR Watcher',
+    ts: Math.floor(Date.now() / 1000),
+  };
+
+  const payload = {
+    username: SLACK.USERNAME,
+    icon_emoji: SLACK.ICON_EMOJI,
+    text: headline,
+    attachments: [attachment],
+  };
+
+  const response = UrlFetchApp.fetch(webhookUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+
+  if (response.getResponseCode() >= 400) {
+    throw new Error(
+      'Slack 通知失敗: ' + response.getResponseCode() + ' ' + response.getContentText()
+    );
+  }
+}
+
+function formatSlackRank_(rows) {
+  if (!rows || rows.length === 0) return '_—_';
+  return rows
+    .map((r, i) => {
+      const exchange = formatExchangeMark_(r.exchange);
+      return (
+        `${String(i + 1).padStart(2, ' ')}. ${formatStockLabel_(r)}` +
+        `\n     \`ADR-東証 ${formatPct_(r.adrTsePct)}\`  ADR¥${formatNumber_(r.adrYen)}  ADR% ${formatPct_(r.adrPct)}  ${exchange}`
+      );
+    })
+    .join('\n');
+}
+
+function formatStockLabel_(row) {
+  if (!row) return '—';
+  const code = row.code;
+  if (!code) return '—';
+  const name = shortenCompanyName_(row.company || code);
+  return `*${code}*（${name}）`;
+}
+
+function formatExchangeMark_(exchange) {
+  if (exchange === 'NYSE') return 'N';
+  if (exchange === 'NASDAQ') return 'Q';
+  if (exchange === 'OTC') return 'OTC';
+  return exchange || '';
+}
+
+function shortenCompanyName_(name) {
+  return String(name)
+    .replace(/（株）/g, '')
+    .replace(/\(株\)/g, '')
+    .replace(/株式会社/g, '')
+    .replace(/ホールディングス/g, 'HD')
+    .replace(/グループ/g, 'G')
+    .replace(/\s+Common Stock$/i, '')
+    .replace(/\s+Capital Stock$/i, '')
+    .trim();
+}
+
+function formatSlackDate_(updatedAt) {
+  const cleaned = String(updatedAt).replace('（テスト）', '').trim();
+  const m = cleaned.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})/);
+  return m ? `${m[1]} ${m[2]}` : cleaned;
+}
+
+function slackColorForChange_(pct) {
+  if (pct > 0) return SLACK.COLOR_UP;
+  if (pct < 0) return SLACK.COLOR_DOWN;
+  return SLACK.COLOR_FLAT;
+}
+
+function formatNumber_(value) {
+  return Number(value).toLocaleString('ja-JP', { maximumFractionDigits: 0 });
+}
+
+function formatPct_(value) {
+  const sign = value >= 0 ? '+' : '';
+  return sign + value.toFixed(2) + '%';
+}
+
+// ---------------------------------------------------------------------------
+// Data fetching (nikkei225jp.com)
+// ---------------------------------------------------------------------------
+
+function fetchAdrRankingData_() {
+  const url = CONFIG.DATA_BASE_URL + CONFIG.PATH_ADR_ALL;
+  const response = UrlFetchApp.fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      Referer: CONFIG.DATA_REFERER,
+    },
+    muteHttpExceptions: true,
+  });
+
+  if (response.getResponseCode() >= 400) {
+    throw new Error('データ取得失敗: ' + url + ' (' + response.getResponseCode() + ')');
+  }
+
+  const text = response.getContentText('UTF-8');
+  const now = new Date();
+  const allRows = parseAdrRows_(text).map((row) =>
+    Object.assign({}, row, { adrTsePct: computeAdrTseSpreadPct_(row, now) })
+  );
+  if (allRows.length < 50) {
+    throw new Error('ADR データが不足しています: ' + allRows.length + ' 件');
+  }
+
+  const sessionKey = getAdrSessionDateKey_(now);
+  const sessionDateLabel = formatAdrSessionDateLabel_(sessionKey);
+  const activeRows = allRows.filter((row) => isActiveAdrRow_(row, sessionKey));
+
+  const ranked = activeRows.slice().sort((a, b) => b.adrTsePct - a.adrTsePct);
+  const topUp = ranked.slice(0, 10);
+  const topDown = ranked.slice().sort((a, b) => a.adrTsePct - b.adrTsePct).slice(0, 10);
+
+  return {
+    allRows,
+    activeRows,
+    topUp,
+    topDown,
+    sessionKey,
+    sessionDateLabel,
+  };
+}
+
+function parseAdrRows_(text) {
+  const re = /A0\[q\]="([^"]+)"/g;
+  const rows = [];
+  let match;
+  let index = 0;
+  while ((match = re.exec(text)) !== null) {
+    rows.push(parseAdrRow_(index, match[1]));
+    index++;
+  }
+  return rows;
+}
+
+function parseAdrRow_(index, raw) {
+  const fields = (index + '_' + raw).split('_');
+  if (fields.length < 19) {
+    throw new Error('ADR 行データの形式が不正です: index=' + index);
+  }
+
+  return {
+    code: fields[1],
+    adrTicker: fields[2],
+    company: fields[3],
+    exchange: fields[6],
+    tseTime: fields[8],
+    tsePrice: toNumber_(fields[9]),
+    tseChange: toNumber_(fields[10]),
+    adrDate: fields[13],
+    adrPct: toNumber_(fields[16]),
+    adrYen: toNumber_(fields[18]),
+  };
+}
+
+/**
+ * nikkei225jp.com/adr/ と同じ ADR-東証 % を算出。
+ * (ADR円換算 - 東証基準値) / 東証基準値 * 100
+ */
+function computeAdrTseSpreadPct_(row, now) {
+  const tz = 'Asia/Tokyo';
+  const hour = parseInt(Utilities.formatDate(now, tz, 'H'), 10);
+  const minute = parseInt(Utilities.formatDate(now, tz, 'm'), 10);
+  const minOfDay = hour * 60 + minute;
+  const overnight = minOfDay < 480 || minOfDay >= 1260;
+
+  const tsti = String(row.tseTime || '');
+  const isTokyoToday = tsti.indexOf(':') !== -1;
+  let prev;
+
+  if (!isTokyoToday) {
+    prev = row.tsePrice;
+  } else if (overnight) {
+    prev = row.tsePrice;
+  } else {
+    prev = row.tsePrice - row.tseChange;
+  }
+
+  if (prev <= 0 || row.adrYen <= 0) {
+    return null;
+  }
+
+  return ((row.adrYen - prev) / prev) * 100;
+}
+
+/**
+ * nikkei225jp.com/adr/ と同じセッション日キー。
+ * 平日 21 時 JST でリセット。土日は金曜セッションへ巻き戻す。
+ */
+function getAdrSessionDateKey_(date) {
+  const h = new Date(date.getTime());
+  h.setHours(h.getHours() - 21);
+  if (h.getDay() === 6) {
+    h.setHours(h.getHours() - 24);
+  }
+  if (h.getDay() === 0) {
+    h.setHours(h.getHours() - 48);
+  }
+  return (h.getMonth() + 1) * 31 + h.getDate();
+}
+
+function parseAdrDateKey_(mmdd) {
+  if (!mmdd || String(mmdd).indexOf('/') === -1) {
+    return null;
+  }
+  const parts = String(mmdd).split('/');
+  if (parts.length < 2) {
+    return null;
+  }
+  return parseInt(parts[0], 10) * 31 + parseInt(parts[1], 10);
+}
+
+function formatAdrSessionDateLabel_(sessionKey) {
+  const month = Math.floor(sessionKey / 31);
+  const day = sessionKey % 31;
+  return month + '/' + day;
+}
+
+function isActiveAdrRow_(row, sessionKey) {
+  const dateKey = parseAdrDateKey_(row.adrDate);
+  if (dateKey == null) {
+    return false;
+  }
+  if (dateKey !== sessionKey) {
+    return false;
+  }
+  if (!row.code) {
+    return false;
+  }
+  return row.adrTsePct != null && !Number.isNaN(row.adrTsePct);
+}
+
+function buildUpdatedAt_() {
+  const dateStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  const time = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'HH:mm');
+  return dateStr + ' ' + time + ':00 JST';
+}
+
+function toNumber_(value) {
+  if (value === '' || value == null) return 0;
+  if (typeof value === 'string' && value.charAt(0) === '#') return 0;
+  const normalized = String(value).replace(/,/g, '').replace(/\+/g, '');
+  const n = Number(normalized);
+  return Number.isNaN(n) ? 0 : n;
+}
