@@ -21,6 +21,10 @@ const CONFIG = {
   TRIGGER_HOUR_JST: 6,
   TRIGGER_MINUTE_JST: 5,
   MIN_ACTIVE_ROWS: 30,
+  /** ADR終了直前の更新のみ採用（終了の何分前まで） */
+  ADR_QUOTE_MAX_AGE_MINUTES: 120,
+  /** 終了時刻後のデータ取り込み猶予（分） */
+  ADR_QUOTE_GRACE_MINUTES: 10,
   DATA_BASE_URL: 'https://nikkei225jp.com',
   DATA_REFERER: 'https://nikkei225jp.com/adr/',
   PATH_ADR_ALL: '/_data/_nfsWEB/adr/_adr_all.js',
@@ -73,7 +77,7 @@ function updateAdrRanking(options) {
   Logger.log('更新開始');
 
   Logger.log('nikkei225jp.com から ADR データ取得中…');
-  const data = fetchAdrRankingData_();
+  const data = fetchAdrRankingData_(options);
   Logger.log(
     `取得完了: 全 ${data.allRows.length} 銘柄 / 有効 ${data.activeRows.length} 銘柄`
   );
@@ -108,7 +112,7 @@ function updateAdrRanking(options) {
 }
 
 function testSlackNotification() {
-  updateAdrRanking({ notifySlack: true, testSlack: true });
+  updateAdrRanking({ notifySlack: true, testSlack: true, relaxedFreshness: true });
   Logger.log('Slack テスト通知を送信しました');
 }
 
@@ -151,7 +155,8 @@ function notifySlack_(data) {
   const metaLine =
     '🏷️ 日本株 ADR · 📅 ' +
     formatSlackDate_(data.updatedAt + (isTest ? '（テスト）' : '')) +
-    ` · セッション ${data.sessionDate || '—'} · 有効 ${data.activeCount} 銘柄`;
+    ` · セッション ${data.sessionDate || '—'} · 有効 ${data.activeCount} 銘柄` +
+    ' · 基準: 東証前日終値 vs ADR終了直前';
 
   const bodyLines = [
     metaLine,
@@ -204,7 +209,7 @@ function formatSlackRank_(rows) {
       const exchange = formatExchangeMark_(r.exchange);
       return (
         `${String(i + 1).padStart(2, ' ')}. ${formatStockLabel_(r)}` +
-        `\n     \`ADR-東証 ${formatPct_(r.adrTsePct)}\`  ADR¥${formatNumber_(r.adrYen)}  ADR% ${formatPct_(r.adrPct)}  ${exchange}`
+        `\n     \`ADR-東証 ${formatPct_(r.adrTsePct)}\`  ADR¥${formatNumber_(r.adrYen)}  ADR% ${formatPct_(r.adrPct)}  更新 ${r.adrMark}  ${exchange}`
       );
     })
     .join('\n');
@@ -262,7 +267,8 @@ function formatPct_(value) {
 // Data fetching (nikkei225jp.com)
 // ---------------------------------------------------------------------------
 
-function fetchAdrRankingData_() {
+function fetchAdrRankingData_(options) {
+  options = options || {};
   const url = CONFIG.DATA_BASE_URL + CONFIG.PATH_ADR_ALL;
   const response = UrlFetchApp.fetch(url, {
     headers: {
@@ -287,7 +293,9 @@ function fetchAdrRankingData_() {
 
   const sessionKey = getAdrSessionDateKey_(now);
   const sessionDateLabel = formatAdrSessionDateLabel_(sessionKey);
-  const activeRows = allRows.filter((row) => isActiveAdrRow_(row, sessionKey));
+  const activeRows = allRows.filter((row) =>
+    isActiveAdrRow_(row, sessionKey, now, options)
+  );
 
   const ranked = activeRows.slice().sort((a, b) => b.adrTsePct - a.adrTsePct);
   const topUp = ranked.slice(0, 10);
@@ -329,7 +337,7 @@ function parseAdrRow_(index, raw) {
     tseTime: fields[8],
     tsePrice: toNumber_(fields[9]),
     tseChange: toNumber_(fields[10]),
-    adrDate: fields[13],
+    adrMark: fields[13],
     adrPct: toNumber_(fields[16]),
     adrYen: toNumber_(fields[18]),
   };
@@ -398,18 +406,77 @@ function formatAdrSessionDateLabel_(sessionKey) {
   return month + '/' + day;
 }
 
-function isActiveAdrRow_(row, sessionKey) {
-  const dateKey = parseAdrDateKey_(row.adrDate);
-  if (dateKey == null) {
-    return false;
-  }
-  if (dateKey !== sessionKey) {
-    return false;
-  }
+function isActiveAdrRow_(row, sessionKey, now, options) {
+  options = options || {};
   if (!row.code) {
     return false;
   }
+  if (!isNotGreyedOutOnSite_(row, sessionKey)) {
+    return false;
+  }
+  if (!options.relaxedFreshness && !isAdrQuoteFreshForClose_(row, now)) {
+    return false;
+  }
   return row.adrTsePct != null && !Number.isNaN(row.adrTsePct);
+}
+
+/**
+ * nikkei225jp.com/adr/ のグレーアウト判定。
+ * [13] が MM/DD のときだけ日付比較。HH:MM のときは日付グレー対象外。
+ */
+function isNotGreyedOutOnSite_(row, sessionKey) {
+  const mark = String(row.adrMark || '');
+  if (mark.indexOf('/') === -1) {
+    return true;
+  }
+  const dateKey = parseAdrDateKey_(mark);
+  return dateKey != null && dateKey === sessionKey;
+}
+
+/**
+ * ADR 終了通知向け: [13] が終了直前（既定2時間以内）の更新のみ採用。
+ * 23:00 台など古い ADR 価格が東証前日終値と突合されて上位化するのを防ぐ。
+ */
+function isAdrQuoteFreshForClose_(row, now) {
+  const mark = String(row.adrMark || '');
+  if (mark.indexOf(':') === -1) {
+    return false;
+  }
+
+  const updateMin = parseTimeToMinutes_(mark);
+  if (updateMin == null) {
+    return false;
+  }
+
+  const sessionEnd = getAdrSessionEndMinute_(now);
+  const minFresh = sessionEnd - CONFIG.ADR_QUOTE_MAX_AGE_MINUTES;
+  const maxFresh = sessionEnd + CONFIG.ADR_QUOTE_GRACE_MINUTES;
+
+  return updateMin >= minFresh && updateMin <= maxFresh;
+}
+
+function parseTimeToMinutes_(hhmm) {
+  const parts = String(hhmm).split(':');
+  if (parts.length < 2) {
+    return null;
+  }
+  const hour = parseInt(parts[0], 10);
+  const minute = parseInt(parts[1], 10);
+  if (Number.isNaN(hour) || Number.isNaN(minute)) {
+    return null;
+  }
+  return hour * 60 + minute;
+}
+
+/** 米国サマータイム: ADR 終了 05:00 JST / 通常 06:00 JST */
+function getAdrSessionEndMinute_(now) {
+  return isUsDaylightSaving_(now) ? 300 : 360;
+}
+
+function isUsDaylightSaving_(date) {
+  const jan = Utilities.formatDate(new Date(date.getFullYear(), 0, 1), 'America/New_York', 'Z');
+  const current = Utilities.formatDate(date, 'America/New_York', 'Z');
+  return current !== jan;
 }
 
 function buildUpdatedAt_() {
