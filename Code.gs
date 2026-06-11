@@ -5,7 +5,8 @@
  *   https://script.google.com/home/projects/1BOpPAteTdkKriIfgG--FDNr2KaEB1-7-pnfrpkSjORx5ZqN0nAyK-AG9/edit
  *
  * データソース:
- *   - nikkei225jp.com ADR 全銘柄
+ *   - 一覧: nikkei225jp.com/_data/_nfsWEB/adr/_adr_all.js
+ *   - ハイブリッド: 一覧が日付グレーアウトの銘柄のみ個別 JSON で ADR 終値を補完
  *   - https://nikkei225jp.com/adr/
  *
  * clasp push:
@@ -28,6 +29,14 @@ const CONFIG = {
   DATA_BASE_URL: 'https://nikkei225jp.com',
   DATA_REFERER: 'https://nikkei225jp.com/adr/',
   PATH_ADR_ALL: '/_data/_nfsWEB/adr/_adr_all.js',
+  PATH_ADR_CHART: '/_data/_nfsWEB/adr/',
+  /** 一覧 [13]=MM/DD 不一致時に個別チャート JSON で補完 */
+  HYBRID_CHART_ENABLED: true,
+  /** 個別 JSON 取得の上限（GAS 実行時間・UrlFetch 枠対策） */
+  HYBRID_MAX_FETCHES: 120,
+  HYBRID_FETCH_CHUNK_SIZE: 20,
+  /** チャート JSON 末尾のみ走査（ティック全件パースを避ける） */
+  HYBRID_CHART_TAIL_BYTES: 80000,
   ADR_PAGE_URL: 'https://nikkei225jp.com/adr/',
 };
 
@@ -79,7 +88,8 @@ function updateAdrRanking(options) {
   Logger.log('nikkei225jp.com から ADR データ取得中…');
   const data = fetchAdrRankingData_(options);
   Logger.log(
-    `取得完了: 全 ${data.allRows.length} 銘柄 / 有効 ${data.activeRows.length} 銘柄`
+    `取得完了: 全 ${data.allRows.length} 銘柄 / 有効 ${data.activeRows.length} 銘柄` +
+      (data.hybridRescued ? ` / チャート補完 ${data.hybridRescued} 銘柄` : '')
   );
 
   if (
@@ -102,6 +112,7 @@ function updateAdrRanking(options) {
       topUp: data.topUp,
       topDown: data.topDown,
       activeCount: data.activeRows.length,
+      hybridRescued: data.hybridRescued || 0,
       sessionDate: data.sessionDateLabel,
       isTest: !!options.testSlack,
     });
@@ -156,6 +167,9 @@ function notifySlack_(data) {
     '🏷️ 日本株 ADR · 📅 ' +
     formatSlackDate_(data.updatedAt + (isTest ? '（テスト）' : '')) +
     ` · セッション ${data.sessionDate || '—'} · 有効 ${data.activeCount} 銘柄` +
+    (data.hybridRescued
+      ? ` · チャート補完 ${data.hybridRescued} 銘柄`
+      : '') +
     ' · 基準: 東証前日終値 vs ADR終了直前';
 
   const bodyLines = [
@@ -284,15 +298,18 @@ function fetchAdrRankingData_(options) {
 
   const text = response.getContentText('UTF-8');
   const now = new Date();
-  const allRows = parseAdrRows_(text).map((row) =>
-    Object.assign({}, row, { adrTsePct: computeAdrTseSpreadPct_(row, now) })
-  );
+  const sessionKey = getAdrSessionDateKey_(now);
+  const sessionDateLabel = formatAdrSessionDateLabel_(sessionKey);
+  let allRows = parseAdrRows_(text);
   if (allRows.length < 50) {
     throw new Error('ADR データが不足しています: ' + allRows.length + ' 件');
   }
 
-  const sessionKey = getAdrSessionDateKey_(now);
-  const sessionDateLabel = formatAdrSessionDateLabel_(sessionKey);
+  const hybridRescued = enrichStaleRowsFromChartJson_(allRows, sessionKey, now, options);
+  allRows = allRows.map((row) =>
+    Object.assign({}, row, { adrTsePct: computeAdrTseSpreadPct_(row, now) })
+  );
+
   const activeRows = allRows.filter((row) =>
     isActiveAdrRow_(row, sessionKey, now, options)
   );
@@ -308,6 +325,165 @@ function fetchAdrRankingData_(options) {
     topDown,
     sessionKey,
     sessionDateLabel,
+    hybridRescued,
+  };
+}
+
+/**
+ * 一覧 [13]=MM/DD でサイトグレーアウトの銘柄だけ、個別チャート JSON から
+ * ADR¥・更新時刻を補完する（285A 型の一覧更新 lag 対策）。
+ */
+function enrichStaleRowsFromChartJson_(rows, sessionKey, now, options) {
+  options = options || {};
+  if (options.hybridChart === false || !CONFIG.HYBRID_CHART_ENABLED) {
+    return 0;
+  }
+
+  const staleRows = rows.filter((row) => isStaleListGreyoutRow_(row, sessionKey));
+  if (staleRows.length === 0) {
+    return 0;
+  }
+
+  const codes = staleRows
+    .map((row) => row.code)
+    .filter(Boolean)
+    .slice(0, CONFIG.HYBRID_MAX_FETCHES);
+  if (codes.length === 0) {
+    return 0;
+  }
+
+  Logger.log(`チャート JSON 補完: ${codes.length} 銘柄を取得…`);
+  const quotesByCode = fetchAdrChartQuotes_(codes, sessionKey, now, options);
+  let rescued = 0;
+
+  rows.forEach((row) => {
+    const quote = quotesByCode[row.code];
+    if (!quote) {
+      return;
+    }
+    row.adrYen = quote.adrYen;
+    row.adrMark = quote.adrMark;
+    row.hybridFromChart = true;
+    rescued++;
+  });
+
+  return rescued;
+}
+
+function isStaleListGreyoutRow_(row, sessionKey) {
+  const mark = String(row.adrMark || '');
+  if (mark.indexOf('/') === -1) {
+    return false;
+  }
+  const dateKey = parseAdrDateKey_(mark);
+  return dateKey != null && dateKey !== sessionKey;
+}
+
+function fetchAdrChartQuotes_(codes, sessionKey, now, options) {
+  const quotes = {};
+  const chunkSize = CONFIG.HYBRID_FETCH_CHUNK_SIZE;
+
+  for (let i = 0; i < codes.length; i += chunkSize) {
+    const chunk = codes.slice(i, i + chunkSize);
+    const requests = chunk.map((code) => ({
+      url:
+        CONFIG.DATA_BASE_URL +
+        CONFIG.PATH_ADR_CHART +
+        encodeURIComponent(code) +
+        '.json',
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        Referer:
+          CONFIG.DATA_BASE_URL + '/adr/adr.php?a=' + encodeURIComponent(code),
+      },
+      muteHttpExceptions: true,
+    }));
+
+    const responses = UrlFetchApp.fetchAll(requests);
+    chunk.forEach((code, index) => {
+      const response = responses[index];
+      if (response.getResponseCode() >= 400) {
+        return;
+      }
+      const quote = parseAdrChartCloseQuote_(
+        response.getContentText('UTF-8'),
+        sessionKey,
+        now,
+        options
+      );
+      if (quote) {
+        quotes[code] = quote;
+      }
+    });
+  }
+
+  return quotes;
+}
+
+/**
+ * 個別チャート ADRm から ADR 終了直前の ADR¥（列 index 2）を抽出。
+ */
+function parseAdrChartCloseQuote_(text, sessionKey, now, options) {
+  options = options || {};
+  const tail =
+    text.length > CONFIG.HYBRID_CHART_TAIL_BYTES
+      ? text.slice(-CONFIG.HYBRID_CHART_TAIL_BYTES)
+      : text;
+  const sessionYmd = sessionKeyToJstYmd_(sessionKey, now);
+  const sessionEnd = getAdrSessionEndMinute_(now);
+  const minFresh = options.relaxedFreshness
+    ? 0
+    : sessionEnd - CONFIG.ADR_QUOTE_MAX_AGE_MINUTES;
+  const maxFresh = options.relaxedFreshness
+    ? 24 * 60 - 1
+    : sessionEnd + CONFIG.ADR_QUOTE_GRACE_MINUTES;
+  const tz = 'Asia/Tokyo';
+  const re = /\[(\d+),([^\]]*)\]/g;
+  let best = null;
+  let match;
+
+  while ((match = re.exec(tail)) !== null) {
+    const ts = parseInt(match[1], 10);
+    if (Number.isNaN(ts)) {
+      continue;
+    }
+    const dt = new Date(ts);
+    const tickMonth = parseInt(Utilities.formatDate(dt, tz, 'M'), 10) - 1;
+    const tickDay = parseInt(Utilities.formatDate(dt, tz, 'd'), 10);
+    if (tickMonth !== sessionYmd.month || tickDay !== sessionYmd.day) {
+      continue;
+    }
+
+    const parts = String(match[2]).split(',');
+    const adrYen = toNumber_(parts[2]);
+    if (adrYen <= 0) {
+      continue;
+    }
+
+    const tickMin =
+      parseInt(Utilities.formatDate(dt, tz, 'H'), 10) * 60 +
+      parseInt(Utilities.formatDate(dt, tz, 'm'), 10);
+    if (tickMin < minFresh || tickMin > maxFresh) {
+      continue;
+    }
+
+    if (!best || ts > best.ts) {
+      best = {
+        ts: ts,
+        adrYen: adrYen,
+        adrMark: Utilities.formatDate(dt, tz, 'HH:mm'),
+      };
+    }
+  }
+
+  return best;
+}
+
+function sessionKeyToJstYmd_(sessionKey, referenceDate) {
+  return {
+    year: parseInt(Utilities.formatDate(referenceDate, 'Asia/Tokyo', 'yyyy'), 10),
+    month: Math.floor(sessionKey / 31) - 1,
+    day: sessionKey % 31,
   };
 }
 
