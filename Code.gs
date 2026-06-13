@@ -32,11 +32,15 @@ const CONFIG = {
   PATH_ADR_CHART: '/_data/_nfsWEB/adr/',
   /** 一覧 [13]=MM/DD 不一致時に個別チャート JSON で補完 */
   HYBRID_CHART_ENABLED: true,
-  /** 個別 JSON 取得の上限（GAS 実行時間・UrlFetch 枠対策） */
-  HYBRID_MAX_FETCHES: 120,
-  HYBRID_FETCH_CHUNK_SIZE: 20,
-  /** チャート JSON 末尾のみ走査（ティック全件パースを避ける） */
-  HYBRID_CHART_TAIL_BYTES: 80000,
+  /** 個別 JSON 取得の上限（GAS 6 分上限対策） */
+  HYBRID_MAX_FETCHES: 50,
+  HYBRID_FETCH_CHUNK_SIZE: 10,
+  /** HTTP Range で末尾のみ取得（フル ~86KB/銘柄を避ける） */
+  HYBRID_RANGE_TAIL_BYTES: 25000,
+  /** パース対象の末尾バイト数（Range 取得分をそのまま走査） */
+  HYBRID_CHART_TAIL_BYTES: 25000,
+  /** チャート補完に使える最大時間（ms）。Slack 通知分を残す */
+  HYBRID_EXECUTION_BUDGET_MS: 240000,
   ADR_PAGE_URL: 'https://nikkei225jp.com/adr/',
 };
 
@@ -339,7 +343,13 @@ function enrichStaleRowsFromChartJson_(rows, sessionKey, now, options) {
     return 0;
   }
 
-  const staleRows = rows.filter((row) => isStaleListGreyoutRow_(row, sessionKey));
+  const staleRows = rows
+    .filter((row) => isStaleListGreyoutRow_(row, sessionKey))
+    .sort((a, b) => {
+      const dateKeyA = parseAdrDateKey_(a.adrMark) || 0;
+      const dateKeyB = parseAdrDateKey_(b.adrMark) || 0;
+      return dateKeyB - dateKeyA;
+    });
   if (staleRows.length === 0) {
     return 0;
   }
@@ -353,6 +363,7 @@ function enrichStaleRowsFromChartJson_(rows, sessionKey, now, options) {
   }
 
   Logger.log(`チャート JSON 補完: ${codes.length} 銘柄を取得…`);
+  const fetchStartedMs = Date.now();
   const quotesByCode = fetchAdrChartQuotes_(codes, sessionKey, now, options);
   let rescued = 0;
 
@@ -366,6 +377,14 @@ function enrichStaleRowsFromChartJson_(rows, sessionKey, now, options) {
     row.hybridFromChart = true;
     rescued++;
   });
+
+  Logger.log(
+    'チャート JSON 補完完了: ' +
+      rescued +
+      ' 銘柄（' +
+      Math.round((Date.now() - fetchStartedMs) / 1000) +
+      ' 秒）'
+  );
 
   return rescued;
 }
@@ -382,8 +401,21 @@ function isStaleListGreyoutRow_(row, sessionKey) {
 function fetchAdrChartQuotes_(codes, sessionKey, now, options) {
   const quotes = {};
   const chunkSize = CONFIG.HYBRID_FETCH_CHUNK_SIZE;
+  const budgetMs = CONFIG.HYBRID_EXECUTION_BUDGET_MS;
+  const startedMs = Date.now();
 
   for (let i = 0; i < codes.length; i += chunkSize) {
+    if (Date.now() - startedMs >= budgetMs) {
+      Logger.log(
+        'チャート JSON 補完: 実行時間上限のため中断（取得済み ' +
+          Object.keys(quotes).length +
+          ' / 対象 ' +
+          codes.length +
+          '）'
+      );
+      break;
+    }
+
     const chunk = codes.slice(i, i + chunkSize);
     const requests = chunk.map((code) => ({
       url:
@@ -395,6 +427,7 @@ function fetchAdrChartQuotes_(codes, sessionKey, now, options) {
         'User-Agent': 'Mozilla/5.0',
         Referer:
           CONFIG.DATA_BASE_URL + '/adr/adr.php?a=' + encodeURIComponent(code),
+        Range: 'bytes=-' + CONFIG.HYBRID_RANGE_TAIL_BYTES,
       },
       muteHttpExceptions: true,
     }));
@@ -402,7 +435,8 @@ function fetchAdrChartQuotes_(codes, sessionKey, now, options) {
     const responses = UrlFetchApp.fetchAll(requests);
     chunk.forEach((code, index) => {
       const response = responses[index];
-      if (response.getResponseCode() >= 400) {
+      const status = response.getResponseCode();
+      if (status >= 400) {
         return;
       }
       const quote = parseAdrChartCloseQuote_(
