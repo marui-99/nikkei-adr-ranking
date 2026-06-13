@@ -16,7 +16,18 @@
  *   1. setupProperties()  … SLACK_WEBHOOK_URL を設定
  *   2. testSlackNotification()  … テスト通知
  *   3. installDailyTrigger()  … 毎日 JST 6:05 自動通知
+ *
+ * 実行フロー:
+ *   一覧取得 → stale 銘柄のチャート JSON を全件取得（時間超過時は自動続行）
+ *   → 全件完了後に Slack 通知（途中通知なし）
  */
+
+const PIPELINE = {
+  PENDING: 'ADR_PIPELINE_PENDING',
+  QUOTES: 'ADR_PIPELINE_QUOTES',
+  OPTIONS: 'ADR_PIPELINE_OPTIONS',
+  SESSION_KEY: 'ADR_PIPELINE_SESSION_KEY',
+};
 
 const CONFIG = {
   TRIGGER_HOUR_JST: 6,
@@ -32,15 +43,15 @@ const CONFIG = {
   PATH_ADR_CHART: '/_data/_nfsWEB/adr/',
   /** 一覧 [13]=MM/DD 不一致時に個別チャート JSON で補完 */
   HYBRID_CHART_ENABLED: true,
-  /** 個別 JSON 取得の上限（GAS 6 分上限対策） */
-  HYBRID_MAX_FETCHES: 50,
   HYBRID_FETCH_CHUNK_SIZE: 10,
   /** HTTP Range で末尾のみ取得（フル ~86KB/銘柄を避ける） */
   HYBRID_RANGE_TAIL_BYTES: 25000,
   /** パース対象の末尾バイト数（Range 取得分をそのまま走査） */
   HYBRID_CHART_TAIL_BYTES: 25000,
-  /** チャート補完に使える最大時間（ms）。Slack 通知分を残す */
-  HYBRID_EXECUTION_BUDGET_MS: 240000,
+  /** 1 回の実行でチャート取得に使う時間（ms）。超過分は続行トリガーへ */
+  PIPELINE_EXECUTION_BUDGET_MS: 270000,
+  /** 続行トリガーまでの待機（ms） */
+  PIPELINE_CONTINUE_DELAY_MS: 30000,
   ADR_PAGE_URL: 'https://nikkei225jp.com/adr/',
 };
 
@@ -80,17 +91,161 @@ function removeTriggers() {
   });
 }
 
-/** 時間トリガーから呼ばれるエントリポイント（ADR取引終了後） */
-function runAfterAdrClose() {
-  updateAdrRanking({ notifySlack: true });
+function removePipelineContinuationTriggers_() {
+  ScriptApp.getProjectTriggers().forEach((t) => {
+    if (t.getHandlerFunction() === 'processHybridPipelineBatch_') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
 }
 
+/** 時間トリガーから呼ばれるエントリポイント（ADR取引終了後） */
+function runAfterAdrClose() {
+  startAdrRankingPipeline({ notifySlack: true });
+}
+
+/** 手動実行用（パイプライン経由） */
 function updateAdrRanking(options) {
+  startAdrRankingPipeline(options || {});
+}
+
+function testSlackNotification() {
+  startAdrRankingPipeline({
+    notifySlack: true,
+    testSlack: true,
+    relaxedFreshness: true,
+  });
+  Logger.log('Slack テスト通知パイプラインを開始しました');
+}
+
+/**
+ * stale 銘柄のチャート取得が全件終わってから Slack 通知する。
+ * 1 回 6 分で終わらない場合は processHybridPipelineBatch_ で自動続行。
+ */
+function startAdrRankingPipeline(options) {
   options = options || {};
-  Logger.log('更新開始');
+  Logger.log('更新開始（パイプライン）');
+  removePipelineContinuationTriggers_();
+  clearPipelineState_();
 
   Logger.log('nikkei225jp.com から ADR データ取得中…');
-  const data = fetchAdrRankingData_(options);
+  const listText = fetchAdrListText_();
+  const now = new Date();
+  const sessionKey = getAdrSessionDateKey_(now);
+  const allRows = parseAdrRows_(listText);
+  if (allRows.length < 50) {
+    throw new Error('ADR データが不足しています: ' + allRows.length + ' 件');
+  }
+
+  const useHybrid = options.hybridChart !== false && CONFIG.HYBRID_CHART_ENABLED;
+  const pending = useHybrid ? collectStaleCodes_(allRows, sessionKey) : [];
+
+  if (pending.length === 0) {
+    Logger.log('チャート JSON 補完: 対象なし — 即時集計');
+    deliverAdrRankingResult_(
+      buildRankingFromRows_(allRows, sessionKey, now, options, {}),
+      options
+    );
+    return;
+  }
+
+  Logger.log('チャート JSON 補完: 対象 ' + pending.length + ' 銘柄 — パイプライン開始');
+  savePipelineState_({
+    pending: pending,
+    quotes: {},
+    options: options,
+    sessionKey: sessionKey,
+  });
+  processHybridPipelineBatch_();
+}
+
+/** 続行トリガーから呼ばれる。全 stale 銘柄の取得完了後に Slack 通知。 */
+function processHybridPipelineBatch_() {
+  const state = loadPipelineState_();
+  if (!state) {
+    Logger.log('パイプライン状態なし — 終了');
+    return;
+  }
+
+  const now = new Date();
+  const startedMs = Date.now();
+  const budgetMs = CONFIG.PIPELINE_EXECUTION_BUDGET_MS;
+  let pending = state.pending.slice();
+  const quotes = Object.assign({}, state.quotes);
+  Logger.log('チャート JSON 補完バッチ: 残り ' + pending.length + ' 銘柄');
+
+  while (pending.length > 0 && Date.now() - startedMs < budgetMs) {
+    const chunk = pending.splice(0, CONFIG.HYBRID_FETCH_CHUNK_SIZE);
+    const batchQuotes = fetchAdrChartQuotes_(chunk, state.sessionKey, now, state.options);
+    chunk.forEach((code) => {
+      quotes[code] = batchQuotes[code] || null;
+    });
+  }
+
+  savePipelineState_({
+    pending: pending,
+    quotes: quotes,
+    options: state.options,
+    sessionKey: state.sessionKey,
+  });
+
+  const rescued = Object.keys(quotes).filter((code) => quotes[code]).length;
+  Logger.log(
+    'チャート JSON 補完進捗: 取得試行 ' +
+      Object.keys(quotes).length +
+      ' / 対象、有効クォート ' +
+      rescued +
+      '、残り ' +
+      pending.length
+  );
+
+  if (pending.length > 0) {
+    Logger.log(
+      'チャート JSON 補完: ' +
+        pending.length +
+        ' 銘柄残 — ' +
+        Math.round(CONFIG.PIPELINE_CONTINUE_DELAY_MS / 1000) +
+        ' 秒後に続行'
+    );
+    scheduleNextPipelineBatch_();
+    return;
+  }
+
+  Logger.log('チャート JSON 補完: 全対象銘柄の取得完了');
+  finalizeAdrRankingAndNotify_();
+}
+
+function finalizeAdrRankingAndNotify_() {
+  const state = loadPipelineState_();
+  if (!state) {
+    throw new Error('パイプライン状態がありません');
+  }
+
+  const now = new Date();
+  const listText = fetchAdrListText_();
+  const allRows = parseAdrRows_(listText);
+  const validQuotes = {};
+  Object.keys(state.quotes).forEach((code) => {
+    if (state.quotes[code]) {
+      validQuotes[code] = state.quotes[code];
+    }
+  });
+
+  const data = buildRankingFromRows_(
+    allRows,
+    state.sessionKey,
+    now,
+    state.options,
+    validQuotes
+  );
+
+  clearPipelineState_();
+  removePipelineContinuationTriggers_();
+  deliverAdrRankingResult_(data, state.options);
+}
+
+function deliverAdrRankingResult_(data, options) {
+  options = options || {};
   Logger.log(
     `取得完了: 全 ${data.allRows.length} 銘柄 / 有効 ${data.activeRows.length} 銘柄` +
       (data.hybridRescued ? ` / チャート補完 ${data.hybridRescued} 銘柄` : '')
@@ -107,12 +262,10 @@ function updateAdrRanking(options) {
     return;
   }
 
-  const updatedAt = buildUpdatedAt_();
-
   if (options.notifySlack) {
     Logger.log('Slack 通知中…');
     notifySlack_({
-      updatedAt,
+      updatedAt: buildUpdatedAt_(),
       topUp: data.topUp,
       topDown: data.topDown,
       activeCount: data.activeRows.length,
@@ -126,9 +279,43 @@ function updateAdrRanking(options) {
   Logger.log('実行完了');
 }
 
-function testSlackNotification() {
-  updateAdrRanking({ notifySlack: true, testSlack: true, relaxedFreshness: true });
-  Logger.log('Slack テスト通知を送信しました');
+function loadPipelineState_() {
+  const props = PropertiesService.getScriptProperties();
+  const pendingJson = props.getProperty(PIPELINE.PENDING);
+  if (!pendingJson) {
+    return null;
+  }
+  return {
+    pending: JSON.parse(pendingJson),
+    quotes: JSON.parse(props.getProperty(PIPELINE.QUOTES) || '{}'),
+    options: JSON.parse(props.getProperty(PIPELINE.OPTIONS) || '{}'),
+    sessionKey: parseInt(props.getProperty(PIPELINE.SESSION_KEY), 10),
+  };
+}
+
+function savePipelineState_(state) {
+  PropertiesService.getScriptProperties().setProperties({
+    [PIPELINE.PENDING]: JSON.stringify(state.pending),
+    [PIPELINE.QUOTES]: JSON.stringify(state.quotes),
+    [PIPELINE.OPTIONS]: JSON.stringify(state.options),
+    [PIPELINE.SESSION_KEY]: String(state.sessionKey),
+  });
+}
+
+function clearPipelineState_() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(PIPELINE.PENDING);
+  props.deleteProperty(PIPELINE.QUOTES);
+  props.deleteProperty(PIPELINE.OPTIONS);
+  props.deleteProperty(PIPELINE.SESSION_KEY);
+}
+
+function scheduleNextPipelineBatch_() {
+  removePipelineContinuationTriggers_();
+  ScriptApp.newTrigger('processHybridPipelineBatch_')
+    .timeBased()
+    .after(CONFIG.PIPELINE_CONTINUE_DELAY_MS)
+    .create();
 }
 
 // ---------------------------------------------------------------------------
@@ -285,8 +472,7 @@ function formatPct_(value) {
 // Data fetching (nikkei225jp.com)
 // ---------------------------------------------------------------------------
 
-function fetchAdrRankingData_(options) {
-  options = options || {};
+function fetchAdrListText_() {
   const url = CONFIG.DATA_BASE_URL + CONFIG.PATH_ADR_ALL;
   const response = UrlFetchApp.fetch(url, {
     headers: {
@@ -300,73 +486,48 @@ function fetchAdrRankingData_(options) {
     throw new Error('データ取得失敗: ' + url + ' (' + response.getResponseCode() + ')');
   }
 
-  const text = response.getContentText('UTF-8');
-  const now = new Date();
-  const sessionKey = getAdrSessionDateKey_(now);
-  const sessionDateLabel = formatAdrSessionDateLabel_(sessionKey);
-  let allRows = parseAdrRows_(text);
-  if (allRows.length < 50) {
-    throw new Error('ADR データが不足しています: ' + allRows.length + ' 件');
-  }
+  return response.getContentText('UTF-8');
+}
 
-  const hybridRescued = enrichStaleRowsFromChartJson_(allRows, sessionKey, now, options);
-  allRows = allRows.map((row) =>
+function buildRankingFromRows_(allRows, sessionKey, now, options, quotesByCode) {
+  options = options || {};
+  quotesByCode = quotesByCode || {};
+  const hybridRescued = applyChartQuotesToRows_(allRows, quotesByCode);
+  const rows = allRows.map((row) =>
     Object.assign({}, row, { adrTsePct: computeAdrTseSpreadPct_(row, now) })
   );
-
-  const activeRows = allRows.filter((row) =>
+  const activeRows = rows.filter((row) =>
     isActiveAdrRow_(row, sessionKey, now, options)
   );
-
   const ranked = activeRows.slice().sort((a, b) => b.adrTsePct - a.adrTsePct);
   const topUp = ranked.slice(0, 10);
   const topDown = ranked.slice().sort((a, b) => a.adrTsePct - b.adrTsePct).slice(0, 10);
 
   return {
-    allRows,
-    activeRows,
-    topUp,
-    topDown,
-    sessionKey,
-    sessionDateLabel,
-    hybridRescued,
+    allRows: rows,
+    activeRows: activeRows,
+    topUp: topUp,
+    topDown: topDown,
+    sessionKey: sessionKey,
+    sessionDateLabel: formatAdrSessionDateLabel_(sessionKey),
+    hybridRescued: hybridRescued,
   };
 }
 
-/**
- * 一覧 [13]=MM/DD でサイトグレーアウトの銘柄だけ、個別チャート JSON から
- * ADR¥・更新時刻を補完する（285A 型の一覧更新 lag 対策）。
- */
-function enrichStaleRowsFromChartJson_(rows, sessionKey, now, options) {
-  options = options || {};
-  if (options.hybridChart === false || !CONFIG.HYBRID_CHART_ENABLED) {
-    return 0;
-  }
-
-  const staleRows = rows
+function collectStaleCodes_(rows, sessionKey) {
+  return rows
     .filter((row) => isStaleListGreyoutRow_(row, sessionKey))
     .sort((a, b) => {
       const dateKeyA = parseAdrDateKey_(a.adrMark) || 0;
       const dateKeyB = parseAdrDateKey_(b.adrMark) || 0;
       return dateKeyB - dateKeyA;
-    });
-  if (staleRows.length === 0) {
-    return 0;
-  }
-
-  const codes = staleRows
+    })
     .map((row) => row.code)
-    .filter(Boolean)
-    .slice(0, CONFIG.HYBRID_MAX_FETCHES);
-  if (codes.length === 0) {
-    return 0;
-  }
+    .filter(Boolean);
+}
 
-  Logger.log(`チャート JSON 補完: ${codes.length} 銘柄を取得…`);
-  const fetchStartedMs = Date.now();
-  const quotesByCode = fetchAdrChartQuotes_(codes, sessionKey, now, options);
+function applyChartQuotesToRows_(rows, quotesByCode) {
   let rescued = 0;
-
   rows.forEach((row) => {
     const quote = quotesByCode[row.code];
     if (!quote) {
@@ -377,15 +538,6 @@ function enrichStaleRowsFromChartJson_(rows, sessionKey, now, options) {
     row.hybridFromChart = true;
     rescued++;
   });
-
-  Logger.log(
-    'チャート JSON 補完完了: ' +
-      rescued +
-      ' 銘柄（' +
-      Math.round((Date.now() - fetchStartedMs) / 1000) +
-      ' 秒）'
-  );
-
   return rescued;
 }
 
@@ -400,56 +552,41 @@ function isStaleListGreyoutRow_(row, sessionKey) {
 
 function fetchAdrChartQuotes_(codes, sessionKey, now, options) {
   const quotes = {};
-  const chunkSize = CONFIG.HYBRID_FETCH_CHUNK_SIZE;
-  const budgetMs = CONFIG.HYBRID_EXECUTION_BUDGET_MS;
-  const startedMs = Date.now();
-
-  for (let i = 0; i < codes.length; i += chunkSize) {
-    if (Date.now() - startedMs >= budgetMs) {
-      Logger.log(
-        'チャート JSON 補完: 実行時間上限のため中断（取得済み ' +
-          Object.keys(quotes).length +
-          ' / 対象 ' +
-          codes.length +
-          '）'
-      );
-      break;
-    }
-
-    const chunk = codes.slice(i, i + chunkSize);
-    const requests = chunk.map((code) => ({
-      url:
-        CONFIG.DATA_BASE_URL +
-        CONFIG.PATH_ADR_CHART +
-        encodeURIComponent(code) +
-        '.json',
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        Referer:
-          CONFIG.DATA_BASE_URL + '/adr/adr.php?a=' + encodeURIComponent(code),
-        Range: 'bytes=-' + CONFIG.HYBRID_RANGE_TAIL_BYTES,
-      },
-      muteHttpExceptions: true,
-    }));
-
-    const responses = UrlFetchApp.fetchAll(requests);
-    chunk.forEach((code, index) => {
-      const response = responses[index];
-      const status = response.getResponseCode();
-      if (status >= 400) {
-        return;
-      }
-      const quote = parseAdrChartCloseQuote_(
-        response.getContentText('UTF-8'),
-        sessionKey,
-        now,
-        options
-      );
-      if (quote) {
-        quotes[code] = quote;
-      }
-    });
+  if (!codes.length) {
+    return quotes;
   }
+
+  const requests = codes.map((code) => ({
+    url:
+      CONFIG.DATA_BASE_URL +
+      CONFIG.PATH_ADR_CHART +
+      encodeURIComponent(code) +
+      '.json',
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      Referer:
+        CONFIG.DATA_BASE_URL + '/adr/adr.php?a=' + encodeURIComponent(code),
+      Range: 'bytes=-' + CONFIG.HYBRID_RANGE_TAIL_BYTES,
+    },
+    muteHttpExceptions: true,
+  }));
+
+  const responses = UrlFetchApp.fetchAll(requests);
+  codes.forEach((code, index) => {
+    const response = responses[index];
+    if (response.getResponseCode() >= 400) {
+      return;
+    }
+    const quote = parseAdrChartCloseQuote_(
+      response.getContentText('UTF-8'),
+      sessionKey,
+      now,
+      options
+    );
+    if (quote) {
+      quotes[code] = quote;
+    }
+  });
 
   return quotes;
 }
